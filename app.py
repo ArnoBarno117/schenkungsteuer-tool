@@ -13,7 +13,7 @@ import re
 from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen, HTTPRedirectHandler, build_opener
 
-VERSION = "1.0 / Rechtsstand geprüft am 09.09.2026"
+VERSION = "1.1 / Rechtsstand geprüft am 09.09.2026"
 BMF_ROOT = "https://www.bundesfinanzministerium.de/"
 BMF_2026 = BMF_ROOT + "Content/DE/Downloads/BMF_Schreiben/Steuerarten/Erbschaft_Schenkungsteuerrecht/2025-10-21-bewert-lebensl-nutzung-leistung-1-1-26.pdf?__blob=publicationFile&v=5"
 ALLOWANCES = {"Ehepartner": 500000, "Kind": 400000, "Enkel": 200000}
@@ -28,12 +28,12 @@ NOTES = [
     "Abzugsbetrag nach § 13a Abs. 2 ErbStG nur bei Auswahl 'Ja'; seine Verfügbarkeit ist vom Nutzer zu prüfen.",
     "Nießbrauch zu 100 % oder kein Nießbrauch. Jahreswert = Nominalbetrag × Ausschüttungsquote, nicht Kurswert × Ausschüttungsquote. Anteiliger Abzug entsprechend der Excel-Vorgabe (§ 10 Abs. 6 ErbStG). Keine Jahreswertbegrenzung nach § 16 BewG gemäß Modellvorgabe.",
     "Keine Berechnung für Steuerklassen II und III, insbesondere keine Ermittlung des Entlastungsbetrages nach § 19a ErbStG für diese Erwerber.",
-    "Steuerpflichtiger Erwerb mindestens null, anschließend Abrundung auf volle 100 EUR (§ 10 Abs. 1 Satz 6 ErbStG). Tarif und Härteausgleich nach § 19 Abs. 1 und 3 ErbStG. Zwischenwerte werden ungerundet weitergerechnet; angezeigte Beträge sind gerundet.",
+    "Steuerpflichtiger Erwerb mindestens null, anschließend Abrundung auf volle 100 EUR (§ 10 Abs. 1 Satz 6 ErbStG). Tarif und Härteausgleich nach § 19 Abs. 1 und 3 ErbStG. Geldbeträge und Ergebnisquoten werden ohne Nachkommastellen angezeigt, intern aber ungerundet weitergerechnet. Kurs, Ausschüttung und BMF-Faktor behalten erforderliche Dezimalstellen. Gerundete Anzeigen können beim Nachrechnen abweichen.",
     "BMF-Tabellen werden jahresbezogen geladen. Das aktualisiert nicht automatisch den gesetzlichen Rechenkern. Für andere Rechtsstände ist eine fachliche Prüfung erforderlich.",
 ]
 
 
-def num(value, places=2):
+def num(value, places=0):
     return f"{D(str(value)):,.{places}f}".replace(',', '_').replace('.', ',').replace('_', '.')
 
 
@@ -41,8 +41,65 @@ def eur(value):
     return num(value) + " EUR"
 
 
-def pct(value, places=4):
+def pct(value, places=0):
     return num(D(str(value)) * 100, places) + " %"
+
+
+def exact_num(value):
+    """Deutsche Schreibweise ohne angehängte Dezimalnullen, ohne Wertverlust."""
+    value = D(str(value))
+    places = max(0, -value.as_tuple().exponent)
+    rendered = num(value, places)
+    return rendered.rstrip('0').rstrip(',') if places else rendered
+
+
+def parse_input(text, whole=False):
+    text = str(text).strip().replace(' ', '').replace('\u00a0', '')
+    if not re.fullmatch(r'(?:\d+|\d{1,3}(?:\.\d{3})+)(?:,\d+)?', text):
+        raise ValueError('Bitte eine deutsche Zahl eingeben, z. B. 1.000.000 (Dezimaltrennzeichen: Komma).')
+    value = D(text.replace('.', '').replace(',', '.'))
+    if whole and value != value.to_integral_value():
+        raise ValueError('Bitte einen Wert ohne Nachkommastellen eingeben.')
+    return value
+
+
+def german_input(label, default, key, maximum=None, whole=False, help=None):
+    import streamlit as st
+    def normalize():
+        try:
+            value = parse_input(st.session_state[key], whole)
+            st.session_state[key] = exact_num(value)
+        except ValueError:
+            pass  # Ungültige Eingabe bleibt zur Korrektur sichtbar.
+    raw = st.text_input(label, value=exact_num(default), key=key,
+                        on_change=normalize, help=help)
+    try:
+        value = parse_input(raw, whole)
+        if maximum is not None and value > maximum:
+            raise ValueError(f'Der Wert darf höchstens {exact_num(maximum)} betragen.')
+        return value
+    except ValueError as error:
+        st.error(str(error))
+        st.stop()
+
+
+def calculation_html(rows):
+    """Drei explizite Spalten, ohne DataFrame-Index und ohne Ergebnisumbruch."""
+    body = ''.join('<tr>'+''.join('<td>'+escape(str(row[k]))+'</td>'
+                   for k in ('Rechenschritt','Berechnung','Ergebnis'))+'</tr>' for row in rows)
+    return '''<style>
+    .tax-scroll {overflow-x:auto; width:100%;}
+    .tax-table {border-collapse:collapse; width:100%; min-width:650px; font-size:1rem;}
+    .tax-table th,.tax-table td {padding:12px 14px; text-align:left; vertical-align:top;
+      border-bottom:1px solid #8895a540; font-variant-numeric:tabular-nums;}
+    .tax-table th {background:#7893b022;}
+    .tax-table td:first-child {width:32%;}
+    .tax-table td:nth-child(2) {overflow-wrap:break-word;}
+    .tax-table th:last-child,.tax-table td:last-child {width:24%; min-width:175px;
+      white-space:nowrap; text-align:right; font-weight:600;}
+    </style><div class="tax-scroll"><table class="tax-table" aria-label="Rechenweg">
+    <thead><tr><th scope="col">Rechenschritt</th><th scope="col">Berechnung</th>
+    <th scope="col">Ergebnis</th></tr></thead><tbody>'''+body+'</tbody></table></div>'
 
 
 def age_on(birth, day):
@@ -83,7 +140,7 @@ def calculate(nominal, course, nonfav_percent, deduction, usufruct, distribution
         rows.append({"Rechenschritt": label, "Berechnung": formula,
                      "Ergebnis": pct(value) if percentage else eur(value)})
         return value
-    total = row("1. Steuerwert der Schenkung", f"{eur(nominal)} × {num(course, 6)}", nominal * course)
+    total = row("1. Steuerwert der Schenkung", f"{eur(nominal)} × {exact_num(course*100)} %", nominal * course)
     fav = row("2. Begünstigtes Vermögen", f"{eur(total)} × {pct(1-nonfav_percent/100)}", total*(1-nonfav_percent/100))
     if fav > 26000000:
         raise ValueError("Begünstigtes Vermögen über 26 Mio. EUR: außerhalb dieses vereinfachten Modells.")
@@ -97,7 +154,7 @@ def calculate(nominal, course, nonfav_percent, deduction, usufruct, distribution
     taxed_fav = row("7. Zusätzlich zu versteuern", f"{eur(rest)} − {eur(applied)}", rest-applied)
     before = row("8. Erwerb vor Nießbrauch", f"{eur(nonfav)} + {eur(taxed_fav)}", nonfav+taxed_fav)
     ratio = row("9. Steuerpflichtiger Anteil am Erwerb", f"{eur(before)} / {eur(total)}", before/total, True)
-    annual = row("10. Jahreswert des Nießbrauchs", f"{eur(nominal)} × {pct(distribution_percent/100)}" if usufruct else "Kein Nießbrauch", nominal*distribution_percent/100 if usufruct else D(0))
+    annual = row("10. Jahreswert des Nießbrauchs", f"{eur(nominal)} × {exact_num(distribution_percent)} %" if usufruct else "Kein Nießbrauch", nominal*distribution_percent/100 if usufruct else D(0))
     capital = row("11. Kapitalwert des Nießbrauchs", f"{eur(annual)} × {num(factor, 3)}" if usufruct else "Kein Nießbrauch", annual*factor if usufruct else D(0))
     allowed_capital = row("12. Abzugsfähiger Kapitalwert", f"{eur(capital)} × {pct(ratio)}", capital*ratio)
     net = row("13. Erwerb nach Nießbrauch", f"{eur(before)} − {eur(allowed_capital)}", before-allowed_capital)
@@ -261,7 +318,7 @@ def make_pdf(inputs, result, source, status):
         return t
     story += [table([['Parameter','Wert']]+list(inputs.items()), [190, 333]),
               p('Rechenweg', 'Heading2'),
-              table([['Rechenschritt','Berechnung','Ergebnis']]+[list(r.values()) for r in result['rows']], [150,260,113]),
+              table([['Rechenschritt','Berechnung','Ergebnis']]+[list(r.values()) for r in result['rows']], [150,233,140]),
               p('BMF-Quelle', 'Heading2'), p(source, 'BodyText'), p(status, 'BodyText'),
               PageBreak(), p('Annahmen und Berechnungsumfang', 'Heading2')]
     story += [p(note, 'BodyText') for note in NOTES]
@@ -281,25 +338,27 @@ def main():
     st.title('Schenkungsteuer-Rechner')
     st.caption('Anteilsübertragung · 85 % Regelverschonung · optionaler Vorbehaltsnießbrauch · ein Erwerber')
     st.info('Vereinfachtes Modell: nur offener Freibetrag; keine Zusammenrechnung oder Steueranrechnung aus Vorerwerben (§ 14 ErbStG).')
-    left, right = st.columns([1, 1.65], gap='large')
+    left, right = st.columns([1, 2.2], gap='large')
     with left:
         st.subheader('Ihre Eingaben')
         day = st.date_input('Schenkungsdatum', date.today(), min_value=date(2026,1,1), max_value=date(2100,12,31), format='DD.MM.YYYY')
         relation = st.selectbox('Verwandtschaftsverhältnis', list(ALLOWANCES), index=1)
         if relation == 'Enkel':
             st.caption('Annahme: Enkel sind nicht Kinder bereits verstorbener Kinder')
-        allowance = st.number_input('Offener Freibetrag (EUR)', min_value=0.0, max_value=float(ALLOWANCES[relation]),
-                                    value=float(ALLOWANCES[relation]), step=1000.0, key='allowance_'+relation)
-        nominal = st.number_input('Nominalbetrag der geschenkten Anteile (EUR)', min_value=0.0, value=100000.0, step=1000.0)
-        course = st.number_input('Kurswert je 1 EUR Nominalbetrag (Multiplikator)', min_value=0.0, value=4.785, step=0.001, format='%.6f', help='4,785 bedeutet 478,5 % des Nominalbetrags.')
-        quote = st.number_input('Nicht begünstigtes Vermögen (%)', min_value=0.0, max_value=100.0, value=10.0, step=0.1, format='%.4f')
+        allowance = german_input('Offener Freibetrag (EUR)', ALLOWANCES[relation], 'allowance_de_'+relation,
+                                  maximum=ALLOWANCES[relation], whole=True)
+        nominal = german_input('Nominalbetrag der geschenkten Anteile (EUR)', 100000, 'nominal_de', whole=True)
+        course_percent = german_input('Kurswert (%)', D('478.5'), 'course_percent_de',
+                                      help='Beispiel: 560 bedeutet 560 % des Nominalbetrags. Dezimalwerte bitte mit Komma eingeben.')
+        course = course_percent / 100
+        quote = german_input('Nicht begünstigtes Vermögen (%)', 10, 'quote_de', maximum=100, whole=True)
         deduction = st.radio('Abzugsbetrag nach § 13a Abs. 2 verfügbar?', ['Ja','Nein'], horizontal=True) == 'Ja'
         usufruct = st.radio('Nießbrauch', ['Ja (100 %)','Nein'], horizontal=True) == 'Ja (100 %)'
         distribution, factor, birth, sex, age = 0.0, D(0), None, None, None
         source, status = 'Kein Nießbrauch: kein BMF-Faktor erforderlich.', ''
         bmf_error = None
         if usufruct:
-            distribution = st.number_input('Durchschnittliche Ausschüttung (% des Nominalbetrags)', min_value=0.0, max_value=100.0, value=5.33, step=0.01, format='%.4f')
+            distribution = german_input('Durchschnittliche Ausschüttung (% des Nominalbetrags)', D('5.33'), 'distribution_de', maximum=100)
             sex = st.selectbox('Geschlecht des Nießbrauchers (BMF-Tabelle)', ['Mann','Frau'])
             birth = st.date_input('Geburtsdatum des Nießbrauchers', date(1972,1,1), min_value=date(1900,1,1), max_value=date(2100,12,31), format='DD.MM.YYYY')
             with st.expander('BMF-Abruf / abweichender offizieller Link'):
@@ -333,21 +392,21 @@ def main():
             st.stop()
         a,b = st.columns(2)
         a.metric('Schenkungsteuer', eur(result['tax']))
-        b.metric('Belastung des geschenkten Anteils', pct(result['burden'], 2))
+        b.metric('Belastung des geschenkten Anteils', pct(result['burden']))
         st.caption(f"Steuerpflichtiger Erwerb: {eur(result['base'])} · Tarif: {pct(result['rate'],0)} · Härteausgleich: {eur(result['relief'])}")
         inputs = {'Schenkungsdatum': day.strftime('%d.%m.%Y'), 'Erwerber': relation,
                   'Offener Freibetrag': eur(allowance), 'Nominalbetrag': eur(nominal),
-                  'Kursmultiplikator': num(course,6), 'Nicht begünstigte Quote': num(quote,4)+' %',
+                  'Kurswert': exact_num(course_percent)+' %', 'Nicht begünstigte Quote': num(quote)+' %',
                   'Regelverschonung': '85 %', 'Abzugsbetrag verfügbar': 'Ja' if deduction else 'Nein',
                   'Nießbrauch': 'Ja (100 %)' if usufruct else 'Nein'}
         if usufruct:
-            inputs.update({'Ausschüttung auf Nominalbetrag':num(distribution,4)+' %', 'Geschlecht': sex,
+            inputs.update({'Ausschüttung auf Nominalbetrag':exact_num(distribution)+' %', 'Geschlecht': sex,
                            'Geburtsdatum':birth.strftime('%d.%m.%Y'), 'Vollendetes Lebensalter':str(age),
                            'BMF-Vervielfältiger':num(factor,3)})
         st.download_button('Berechnung als PDF speichern', make_pdf(inputs,result,source,status),
                            file_name=f'Schenkungsteuer_{day.isoformat()}.pdf', mime='application/pdf')
-        st.table(result['rows'])
-        st.caption('Zwischenwerte ungerundet weitergerechnet; Geldbeträge zur Anzeige auf zwei Nachkommastellen gerundet.')
+        st.html(calculation_html(result['rows']))
+        st.caption('Geldbeträge und Ergebnisquoten werden ohne Nachkommastellen angezeigt. Intern wird ungerundet gerechnet. Kurs, Ausschüttung und BMF-Faktor bleiben mit ihren erforderlichen Dezimalstellen sichtbar.')
         st.write(source)
         if status:
             st.caption(status)
